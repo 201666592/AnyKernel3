@@ -41,29 +41,64 @@ apply_sukisu() {
   fi
 }
 
-# 自定义管理器证书覆盖：把 SukiSU 官方信任槽 EXPECTED_HASH/SIZE 替换为我们自己的
-# DataBackup 证书。优先级：函数参数 > 环境变量 KSU_CERT_HASH/SIZE > 内置默认。
-# 内置默认即我们的证书，确保即使 workflow 未传参也会焊死，恢复出厂后直接安装
-# DataBackup（包名 com.sukisu.ultra）即获 root，无需官方 SukiSU 管理器。
+# 自定义管理器证书覆盖：把 SukiSU 官方信任槽 EXPECTED_HASH/SIZE 换成我们的证书。
+# 上游 Kbuild 用的是 `KSU_EXPECTED_HASH ?= ...`（带问号），且 -s builtin 分支可能
+# 把定义放在 Makefile，因此遍历 kernel/ 下所有构建文件逐个替换。注入后强制校验，
+# 校验不通过直接让构建失败，避免产出"日志显示成功、实际仍是官方证书"的假包。
 apply_custom_cert() {
   local hash="${1:-$KSU_CERT_HASH}"
   local size="${2:-$KSU_CERT_SIZE}"
   if [ -z "$hash" ]; then hash="$KSU_BUILTIN_HASH"; fi
   if [ -z "$size" ]; then size="$KSU_BUILTIN_SIZE"; fi
-  local kbuild=""
-  for f in "$KSU_DIR/kernel/Kbuild" "$KSU_DIR/kernel/Makefile"; do
-    if [ -f "$f" ]; then kbuild="$f"; break; fi
+
+  local f changed=0
+  local files=()
+  for f in "$KSU_DIR"/kernel/Kbuild "$KSU_DIR"/kernel/Makefile "$KSU_DIR"/kernel/*.mk; do
+    if [ -f "$f" ]; then files+=("$f"); fi
   done
-  if [ -z "$kbuild" ]; then
-    echo "::warning::未找到 Kbuild/Makefile，跳过自定义证书注入"
-    return 0
+  if [ ${#files[@]} -eq 0 ]; then
+    echo "::error::未找到 KernelSU/kernel/ 下的 Kbuild/Makefile，无法注入自定义证书"
+    exit 1
   fi
+
+  for f in "${files[@]}"; do
+    if grep -qE '^KSU_EXPECTED_HASH[[:space:]]*[:?+]?=' "$f"; then
+      # 兼容 ?= / := / += / = 任意赋值运算符，仅匹配行首变量定义，不碰 ccflags-y 引用行
+      sed -i -E "s|^(KSU_EXPECTED_HASH[[:space:]]*[:?+]?=).*|\1 $hash|" "$f"
+      sed -i -E "s|^(KSU_EXPECTED_SIZE[[:space:]]*[:?+]?=).*|\1 $size|" "$f"
+      changed=1
+    fi
+  done
+
+  if [ "$changed" -eq 0 ]; then
+    # 兜底：在 ccflags-y += -DEXPECTED_HASH= 锚点前插入强赋值（覆盖上游 ?= 默认值）
+    for f in "${files[@]}"; do
+      if grep -qE '^ccflags-y[[:space:]]*\+=[[:space:]]*-DEXPECTED_HASH=' "$f"; then
+        awk -v h="$hash" -v s="$size" '
+          !done && /^ccflags-y[[:space:]]*\+=[[:space:]]*-DEXPECTED_HASH=/ {
+            print "KSU_EXPECTED_SIZE = " s
+            print "KSU_EXPECTED_HASH = " h
+            done = 1
+          }
+          { print }
+        ' "$f" > "$f.new" && mv "$f.new" "$f"
+        changed=1
+        break
+      fi
+    done
+  fi
+
+  if [ "$changed" -eq 0 ]; then
+    echo "::error::未定位到 KSU_EXPECTED_HASH 定义或 ccflags 锚点，证书注入失败"
+    exit 1
+  fi
+  if ! grep -RqsF "$hash" "$KSU_DIR"/kernel/; then
+    echo "::error::证书注入校验失败：KSU_EXPECTED_HASH 未变成 $hash"
+    exit 1
+  fi
+
   echo "覆盖 SukiSU 信任槽为自定义管理器证书: hash=$hash size=$size"
-  # 兼容 ?= / := / = 任意赋值运算符；仅匹配行首 KSU_EXPECTED_HASH/SIZE，
-  # 不会误伤 KSU_EXPECTED_SIZE2（FinaSU 第二槽）与 ccflags-y 引用行。
-  sed -i "s|^KSU_EXPECTED_HASH[[:space:]]*=.*|KSU_EXPECTED_HASH ?= $hash|" "$kbuild"
-  sed -i "s|^KSU_EXPECTED_SIZE[[:space:]]*=.*|KSU_EXPECTED_SIZE ?= $size|" "$kbuild"
-  grep -nE "^KSU_EXPECTED_HASH|^KSU_EXPECTED_SIZE" "$kbuild" || true
+  grep -RnE '^KSU_EXPECTED_(HASH|SIZE)[[:space:]]*[:?+]?=' "$KSU_DIR"/kernel/ || true
 }
 
 case "$MODE" in
