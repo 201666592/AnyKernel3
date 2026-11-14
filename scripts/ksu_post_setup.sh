@@ -35,16 +35,20 @@ apply_sukisu() {
   done
   if [ -n "$kbuild" ]; then
     local pat=$(echo "${PATTERNS[sukisu_branch]}" | base64 -d)
-    sed -i "s/${pat}/@${BRAND}/" "$kbuild"
+    sed "s/${pat}/@${BRAND}/" "$kbuild" > "$kbuild.tmp" && cat "$kbuild.tmp" > "$kbuild" && rm -f "$kbuild.tmp"
     local rel="${kbuild#${KSU_DIR}/}"
     git -C "$KSU_DIR" update-index --skip-worktree "$rel"
   fi
 }
 
-# 自定义管理器证书覆盖：把 SukiSU 官方信任槽 EXPECTED_HASH/SIZE 换成我们的证书。
-# 上游 Kbuild 用的是 `KSU_EXPECTED_HASH ?= ...`（带问号），且 -s builtin 分支可能
-# 把定义放在 Makefile，因此遍历 kernel/ 下所有构建文件逐个替换。注入后强制校验，
-# 校验不通过直接让构建失败，避免产出"日志显示成功、实际仍是官方证书"的假包。
+# 自定义管理器证书覆盖：把我们的证书加入 SukiSU 内核信任列表。
+# SukiSU 不同分支的信任槽位置不同，必须三条路径都覆盖：
+#  - builtin 分支（本构建实际使用）：kernel/manager/apk_sign.c 的 apk_sign_keys[] 数组，
+#    is_manager_apk() 遍历该数组比对 V2 签名证书 size+sha256；官方 7 个条目保留，追加我们的。
+#  - main 分支：kernel/Kbuild 的 KSU_EXPECTED_HASH ?= / KSU_EXPECTED_SIZE ?= 经
+#    -DEXPECTED_HASH 传给 C（注意是 `?=` 形式，sed 必须兼容）。
+#  - 兜底：ccflags-y += -DEXPECTED_HASH= 锚点前插入强赋值。
+# 最后强制校验源码里确实出现我们的 hash，否则让构建失败，杜绝"日志说成功、镜像仍是官方证书"。
 apply_custom_cert() {
   local hash="${1:-$KSU_CERT_HASH}"
   local size="${2:-$KSU_CERT_SIZE}"
@@ -56,22 +60,38 @@ apply_custom_cert() {
   for f in "$KSU_DIR"/kernel/Kbuild "$KSU_DIR"/kernel/Makefile "$KSU_DIR"/kernel/*.mk; do
     if [ -f "$f" ]; then files+=("$f"); fi
   done
-  if [ ${#files[@]} -eq 0 ]; then
-    echo "::error::未找到 KernelSU/kernel/ 下的 Kbuild/Makefile，无法注入自定义证书"
-    exit 1
+
+  # 路径 A：builtin 分支的 C 源码信任列表（追加，不删官方条目）
+  local sign_src="$KSU_DIR/kernel/manager/apk_sign.c"
+  if [ -f "$sign_src" ]; then
+    if grep -qF "$hash" "$sign_src"; then
+      changed=1
+    else
+      awk -v h="$hash" -v s="$size" '
+        !done && /apk_sign_keys\[\] = \{/ {
+          print
+          print "    { " s ", \"" h "\" }, // DataBackup custom manager"
+          done = 1
+          next
+        }
+        { print }
+      ' "$sign_src" > "$sign_src.new" && cat "$sign_src.new" > "$sign_src" && rm -f "$sign_src.new"
+      changed=1
+    fi
+    git -C "$KSU_DIR" update-index --skip-worktree kernel/manager/apk_sign.c 2>/dev/null || true
   fi
 
+  # 路径 B：main 分支 Kbuild/Makefile 的变量定义（兼容 ?= / := / += / =）
   for f in "${files[@]}"; do
     if grep -qE '^KSU_EXPECTED_HASH[[:space:]]*[:?+]?=' "$f"; then
-      # 兼容 ?= / := / += / = 任意赋值运算符，仅匹配行首变量定义，不碰 ccflags-y 引用行
       sed -i -E "s|^(KSU_EXPECTED_HASH[[:space:]]*[:?+]?=).*|\1 $hash|" "$f"
       sed -i -E "s|^(KSU_EXPECTED_SIZE[[:space:]]*[:?+]?=).*|\1 $size|" "$f"
       changed=1
     fi
   done
 
+  # 路径 C：兜底，在 ccflags 锚点前插入强赋值（覆盖上游 ?= 默认值）
   if [ "$changed" -eq 0 ]; then
-    # 兜底：在 ccflags-y += -DEXPECTED_HASH= 锚点前插入强赋值（覆盖上游 ?= 默认值）
     for f in "${files[@]}"; do
       if grep -qE '^ccflags-y[[:space:]]*\+=[[:space:]]*-DEXPECTED_HASH=' "$f"; then
         awk -v h="$hash" -v s="$size" '
@@ -81,7 +101,7 @@ apply_custom_cert() {
             done = 1
           }
           { print }
-        ' "$f" > "$f.new" && mv "$f.new" "$f"
+        ' "$f" > "$f.new" && cat "$f.new" > "$f" && rm -f "$f.new"
         changed=1
         break
       fi
@@ -89,16 +109,16 @@ apply_custom_cert() {
   fi
 
   if [ "$changed" -eq 0 ]; then
-    echo "::error::未定位到 KSU_EXPECTED_HASH 定义或 ccflags 锚点，证书注入失败"
+    echo "::error::未定位到 apk_sign_keys[] / KSU_EXPECTED_HASH / ccflags 锚点，证书注入失败"
     exit 1
   fi
   if ! grep -RqsF "$hash" "$KSU_DIR"/kernel/; then
-    echo "::error::证书注入校验失败：KSU_EXPECTED_HASH 未变成 $hash"
+    echo "::error::证书注入校验失败：源码中未找到 $hash"
     exit 1
   fi
 
   echo "覆盖 SukiSU 信任槽为自定义管理器证书: hash=$hash size=$size"
-  grep -RnE '^KSU_EXPECTED_(HASH|SIZE)[[:space:]]*[:?+]?=' "$KSU_DIR"/kernel/ || true
+  grep -RnF "$hash" "$KSU_DIR"/kernel/ | head -5 || true
 }
 
 case "$MODE" in
