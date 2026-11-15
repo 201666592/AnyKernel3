@@ -18,6 +18,9 @@ BRAND=$(echo 'TGluZ0x1bw==' | base64 -d)
 # 恢复出厂设置直接安装 DataBackup 即获得 root，无需官方 SukiSU 管理器、无需动态注册。
 KSU_BUILTIN_HASH="98d06d98fc29c6a59574dedab3bd21e25add3aca6e7c4501ae528694428960e8"
 KSU_BUILTIN_SIZE="0x18c"
+# 主路径加冕依赖包名 == 内核 KSU_PACKAGE_NAME。upstream builtin 默认是 com.sukisu.nova，
+# 必须焊死成 com.sukisu.ultra，与 APK applicationId 双向对齐，避免退化到 sig_fallback 备用路径。
+KSU_BUILTIN_PKG="com.sukisu.ultra"
 
 apply_bakasu() {
   local kbuild="$KSU_DIR/kernel/Kbuild"
@@ -37,8 +40,35 @@ apply_sukisu() {
     local pat=$(echo "${PATTERNS[sukisu_branch]}" | base64 -d)
     sed "s/${pat}/@${BRAND}/" "$kbuild" > "$kbuild.tmp" && cat "$kbuild.tmp" > "$kbuild" && rm -f "$kbuild.tmp"
     local rel="${kbuild#${KSU_DIR}/}"
-    git -C "$KSU_DIR" update-index --skip-worktree "$rel"
+    git -C "$KSU_DIR" update-index --skip-worktree "$rel" 2>/dev/null || true
   fi
+}
+
+# 把 KSU_PACKAGE_NAME 焊死成我们 APK 的包名，让 throne_tracker 主路径
+# crown_manager() 在 packages.list 里按包名直接加冕（不依赖 sig_fallback 备用路径）。
+# 覆盖 Makefile / Kbuild，兼容 ?= / = / := / += 任意赋值；末尾强制校验，失败即中断构建。
+apply_sukisu_pkg() {
+  local f changed=0
+  local files=()
+  for f in "$KSU_DIR/kernel/Makefile" "$KSU_DIR/kernel/Kbuild" "$KSU_DIR"/kernel/*.mk; do
+    if [ -f "$f" ]; then files+=("$f"); fi
+  done
+  for f in "${files[@]}"; do
+    if grep -qE '^KSU_PACKAGE_NAME[[:space:]]*[:?+]?=' "$f"; then
+      sed -i -E "s|^(KSU_PACKAGE_NAME[[:space:]]*[:?+]?=).*|\1 $KSU_BUILTIN_PKG|" "$f"
+      changed=1
+    fi
+  done
+  if [ "$changed" -eq 0 ]; then
+    echo "::error::未定位到 KSU_PACKAGE_NAME 定义，包名焊死失败"
+    exit 1
+  fi
+  if ! grep -RqsF "$KSU_BUILTIN_PKG" "$KSU_DIR"/kernel/; then
+    echo "::error::包名焊死校验失败：源码中未找到 $KSU_BUILTIN_PKG"
+    exit 1
+  fi
+  echo "焊死 KSU_PACKAGE_NAME=$KSU_BUILTIN_PKG（主路径加冕，与 APK 包名对齐）"
+  grep -RnF "KSU_PACKAGE_NAME" "$KSU_DIR"/kernel/ | head -5 || true
 }
 
 # 自定义管理器证书覆盖：把我们的证书加入 SukiSU 内核信任列表。
@@ -124,7 +154,7 @@ apply_custom_cert() {
 case "$MODE" in
   bakasu)   apply_bakasu ;;
   # SukiSU：强制焊死我们的证书（忽略环境变量，确保必然生效）
-  sukisu)   apply_sukisu; apply_custom_cert "$KSU_BUILTIN_HASH" "$KSU_BUILTIN_SIZE" ;;
+  sukisu)   apply_sukisu; apply_sukisu_pkg; apply_custom_cert "$KSU_BUILTIN_HASH" "$KSU_BUILTIN_SIZE" ;;
   auto)
     # 自动检测：根据 KSU 目录内容判断变体
     if [ -f "$KSU_DIR/kernel/Kbuild" ] && grep -q "$(echo "${PATTERNS[marker]}" | base64 -d)" "$KSU_DIR/kernel/Kbuild" 2>/dev/null; then
@@ -132,6 +162,7 @@ case "$MODE" in
     else
       apply_sukisu
     fi
+    apply_sukisu_pkg
     apply_custom_cert
     ;;
   *) echo "未知模式: $MODE" >&2; exit 1 ;;
