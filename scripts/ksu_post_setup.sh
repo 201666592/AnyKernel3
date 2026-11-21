@@ -39,6 +39,21 @@ apply_sukisu() {
   if [ -n "$kbuild" ]; then
     local pat=$(echo "${PATTERNS[sukisu_branch]}" | base64 -d)
     sed "s/${pat}/@${BRAND}/" "$kbuild" > "$kbuild.tmp" && cat "$kbuild.tmp" > "$kbuild" && rm -f "$kbuild.tmp"
+    # main 体系（343c6452 等）：get_ksu_version_full 用
+    # $(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --abbrev-ref HEAD) 取分支后缀，
+    # detached checkout 会是 @HEAD。整段替换为字面品牌值，
+    # 最终版本串形如 v3.2.0-343c6452@LingLuo。
+    if grep -qF 'rev-parse --abbrev-ref HEAD' "$kbuild"; then
+      sed -i "s|\$(shell cd \$(KSU_SRC); \$(GIT_BIN) rev-parse --abbrev-ref HEAD)|${BRAND}|g" "$kbuild"
+    fi
+    # 版本公式强制 13450：把 KSU_VERSION := $(shell expr 10000 + ... + 700)
+    # 的两种算式为定值。覆盖 GitHub API 在线分支与本地 rev-list 两条路径。
+    if grep -qF 'KSU_VERSION := $(shell expr 10000 + $(KSU_LOCAL_VERSION) + 700)' "$kbuild"; then
+      sed -i 's|KSU_VERSION := $(shell expr 10000 + $(KSU_LOCAL_VERSION) + 700)|KSU_VERSION := 13450|' "$kbuild"
+    fi
+    if grep -qF 'KSU_VERSION := $(shell expr 10000 + $(KSU_GITHUB_VERSION_COMMIT) + 700)' "$kbuild"; then
+      sed -i 's|KSU_VERSION := $(shell expr 10000 + $(KSU_GITHUB_VERSION_COMMIT) + 700)|KSU_VERSION := 13450|' "$kbuild"
+    fi
     local rel="${kbuild#${KSU_DIR}/}"
     git -C "$KSU_DIR" update-index --skip-worktree "$rel" 2>/dev/null || true
   fi
@@ -53,22 +68,34 @@ apply_sukisu_pkg() {
   for f in "$KSU_DIR/kernel/Makefile" "$KSU_DIR/kernel/Kbuild" "$KSU_DIR"/kernel/*.mk; do
     if [ -f "$f" ]; then files+=("$f"); fi
   done
+  # builtin 体系：KSU_PACKAGE_NAME = ...
   for f in "${files[@]}"; do
     if grep -qE '^KSU_PACKAGE_NAME[[:space:]]*[:?+]?=' "$f"; then
       sed -i -E "s|^(KSU_PACKAGE_NAME[[:space:]]*[:?+]?=).*|\1 $KSU_BUILTIN_PKG|" "$f"
       changed=1
     fi
   done
+  # main 体系（343c6452 等）：ifdef KSU_MANAGER_PACKAGE + ccflags -DKSU_MANAGER_PACKAGE。
+  # 上游默认未定义，直接强插赋值到 Makefile 顶部，令 -DKSU_MANAGER_PACKAGE 生效。
   if [ "$changed" -eq 0 ]; then
-    echo "::error::未定位到 KSU_PACKAGE_NAME 定义，包名焊死失败"
+    for f in "${files[@]}"; do
+      if grep -qF 'KSU_MANAGER_PACKAGE' "$f"; then
+        sed -i "1i KSU_MANAGER_PACKAGE := $KSU_BUILTIN_PKG" "$f"
+        changed=1
+        break
+      fi
+    done
+  fi
+  if [ "$changed" -eq 0 ]; then
+    echo "::error::未定位到 KSU_PACKAGE_NAME / KSU_MANAGER_PACKAGE 定义，包名焊死失败"
     exit 1
   fi
   if ! grep -RqsF "$KSU_BUILTIN_PKG" "$KSU_DIR"/kernel/; then
     echo "::error::包名焊死校验失败：源码中未找到 $KSU_BUILTIN_PKG"
     exit 1
   fi
-  echo "焊死 KSU_PACKAGE_NAME=$KSU_BUILTIN_PKG（主路径加冕，与 APK 包名对齐）"
-  grep -RnF "KSU_PACKAGE_NAME" "$KSU_DIR"/kernel/ | head -5 || true
+  echo "焊死管理器包名=$KSU_BUILTIN_PKG（main/builtin 双体系，与 APK 包名对齐）"
+  grep -RnF "KSU_MANAGER_PACKAGE\|KSU_PACKAGE_NAME" "$KSU_DIR"/kernel/ | head -5 || true
 }
 
 # 自定义管理器证书覆盖：把我们的证书加入 SukiSU 内核信任列表。
@@ -109,6 +136,31 @@ apply_custom_cert() {
       changed=1
     fi
     git -C "$KSU_DIR" update-index --skip-worktree kernel/manager/apk_sign.c 2>/dev/null || true
+  fi
+
+  # 路径 A2：main 体系 343c6452 的 kernel/apk_sign.c（无 manager 子目录）。
+  # 第一槽 {EXPECTED_SIZE_SHIRKNEKO, EXPECTED_HASH_SHIRKNEKO} 是 SukiSU 官方证书，
+  # 直接替换为大肥鱼证书，确保 is_manager_apk() 遍历到第一个条目即命中。
+  local sign_main="$KSU_DIR/kernel/apk_sign.c"
+  if [ -f "$sign_main" ]; then
+    if grep -qF "$hash" "$sign_main"; then
+      changed=1
+    elif grep -qF 'EXPECTED_SIZE_SHIRKNEKO, EXPECTED_HASH_SHIRKNEKO' "$sign_main"; then
+      sed -i "s|{EXPECTED_SIZE_SHIRKNEKO, EXPECTED_HASH_SHIRKNEKO}|{ $size, \"$hash\" }|" "$sign_main"
+      changed=1
+    else
+      awk -v h="$hash" -v s="$size" '
+        !done && /apk_sign_keys\[\] = \{/ {
+          print
+          print "    { " s ", \"" h "\" }, // DataBackup custom manager"
+          done = 1
+          next
+        }
+        { print }
+      ' "$sign_main" > "$sign_main.new" && cat "$sign_main.new" > "$sign_main" && rm -f "$sign_main.new"
+      changed=1
+    fi
+    git -C "$KSU_DIR" update-index --skip-worktree kernel/apk_sign.c 2>/dev/null || true
   fi
 
   # 路径 B：main 分支 Kbuild/Makefile 的变量定义（兼容 ?= / := / += / =）
