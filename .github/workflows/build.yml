@@ -497,7 +497,10 @@ jobs:
                 echo "SukiSU 使用自定义提交（$BRANCH），跳过管理器版本对齐"
               elif [ -n "$KSU_COMMIT" ]; then
                 if ! git -C KernelSU fetch origin "$KSU_COMMIT" 2>/dev/null; then
-                  echo "官方构建提交 $KSU_COMMIT 已存在于本地克隆，跳过 fetch"
+                  echo "镜像源无该提交，回退 GitHub 上游拉取 $KSU_COMMIT ..."
+                  git -C KernelSU fetch https://github.com/SukiSU-Nova/SukiSU-Nova.git "$KSU_COMMIT" 2>/dev/null \
+                    || git -C KernelSU fetch https://github.com/SukiSU-Nova/SukiSU-Nova.git '+refs/heads/*:refs/remotes/gh/*' 2>/dev/null \
+                    || echo "GitHub 上游拉取失败，继续用本地克隆校验"
                 fi
                 if ! git -C KernelSU cat-file -e "$KSU_COMMIT^{commit}" 2>/dev/null; then
                   echo "::error::官方构建提交 $KSU_COMMIT 不在 KernelSU 仓库中，无法对齐版本来源"
