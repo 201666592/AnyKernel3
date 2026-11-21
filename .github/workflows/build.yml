@@ -494,7 +494,24 @@ jobs:
               #  优先 GitHub API，回退本地 rev-list）。将 REPO_BRANCH 改写为官方
               # 构建提交，保证内核 KSU 版本与拉取的管理器安装包严格一致
               if [ -n "$KSU_COMMIT" ] && [ "$BRANCH" != "-s main" ] && [ "$BRANCH" != "-s builtin" ]; then
-                echo "SukiSU 使用自定义提交（$BRANCH），跳过管理器版本对齐"
+                # config/config 指定自定义提交（如 3.2.0 的 343c6452）：
+                # setup.sh 克隆的 shirkneko 镜像未必含该提交，强制从 GitHub 上游
+                # fetch 并 checkout --detach，确保内核源码真正对齐到锁定提交。
+                echo "SukiSU 使用自定义提交（$KSU_COMMIT），强制检出该提交"
+                if ! git -C KernelSU cat-file -e "$KSU_COMMIT^{commit}" 2>/dev/null; then
+                  git -C KernelSU fetch https://github.com/SukiSU-Nova/SukiSU-Nova.git "$KSU_COMMIT" 2>/dev/null \
+                    || git -C KernelSU fetch https://github.com/SukiSU-Nova/SukiSU-Nova.git '+refs/heads/*:refs/remotes/gh/*' 2>/dev/null \
+                    || echo "GitHub 上游拉取失败，继续用本地克隆校验"
+                fi
+                if ! git -C KernelSU cat-file -e "$KSU_COMMIT^{commit}" 2>/dev/null; then
+                  echo "::error::锁定提交 $KSU_COMMIT 不在 KernelSU 仓库中，无法对齐 3.2.0 源码"
+                  exit 1
+                fi
+                git -C KernelSU checkout --detach "$KSU_COMMIT"
+                echo "KernelSU 已检出到锁定提交 $(git -C KernelSU rev-parse --short=12 HEAD)"
+                # 3.2.0 / 13450：版本对齐由 ksu_post_setup.sh 在 Makefile 内写死，
+                # 此处不再用本地提交数计算（343c6452 在重写历史后仅 331 个祖先，
+                # 公式会误算成 11031）。
               elif [ -n "$KSU_COMMIT" ]; then
                 if ! git -C KernelSU fetch origin "$KSU_COMMIT" 2>/dev/null; then
                   echo "镜像源无该提交，回退 GitHub 上游拉取 $KSU_COMMIT ..."
@@ -668,6 +685,10 @@ jobs:
       - name: 同步 SukiSU 内核 UAPI 版本（对齐官方管理器）
         if: inputs.ksu_variant == 'SukiSU'
         working-directory: ${{ env.KERNEL_ROOT }}
+        env:
+          # 锁定到 main 体系提交（如 3.2.0 的 343c6452）时无 builtin 专属 UAPI 结构，
+          # 允许脚本在检测不到目标文件时安全跳过，避免误中断构建。
+          SKIP_INCOMPATIBLE: "true"
         run: bash "$GITHUB_WORKSPACE/scripts/ksu_uapi_sync/sync_uapi.sh" KernelSU
 
       # SukiSU builtin 分支的 hook/lsm_hook.c 仍以旧签名调用
@@ -680,6 +701,10 @@ jobs:
       - name: 应用 SukiSU 内核 API 兼容补丁 (6.8+ lsm_id / 6.11+ netlink cb_mutex)
         if: inputs.ksu_variant == 'SukiSU'
         working-directory: ${{ env.KERNEL_ROOT }}
+        env:
+          # main 体系提交（如 343c6452）无 builtin 专属 hook/lsm_hook.c 等文件，
+          # 内容检测未命中时安全跳过，避免老代码路径误中断。
+          SKIP_INCOMPATIBLE: "true"
         run: bash "$GITHUB_WORKSPACE/scripts/sukisu_compat/apply.sh" KernelSU
 
       - name: 应用 SUSFS 补丁
