@@ -286,6 +286,13 @@ on:
         required: false
         type: boolean
         default: false
+      # 可选：锁定 KernelSU 提交 SHA（回退旧版本用）。留空=沿用官方最新上传 Manager 构建。
+      # 例：13450(v3.2.0)=7a7b2d609c394b73d5a0b2a876559f667ba0a3e0
+      pin_ksu_commit:
+        description: "锁定 KernelSU 提交 SHA（留空=最新；回退旧版本用）"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   resolve-version:
@@ -406,7 +413,7 @@ jobs:
       ksu_variant: ${{ inputs.kernelsu_variant }}
       # 内核侧 KernelSU 检出到官方最新上传 Manager 构建的同一提交，
       # 使内核 KSU 版本与拉取的管理器安装包严格一致（BakaSU / FinaSU 生效）
-      ksu_commit: ${{ needs.get-ksu-manager.outputs.ksuCommit }}
+      ksu_commit: ${{ inputs.pin_ksu_commit != '' && inputs.pin_ksu_commit || needs.get-ksu-manager.outputs.ksuCommit }}
       ksu_cert_size: ${{ needs.get-ksu-manager.outputs.managerCertSize }}
       ksu_cert_hash: ${{ needs.get-ksu-manager.outputs.managerCertHash }}
       version: ${{ inputs.version || '' }}
