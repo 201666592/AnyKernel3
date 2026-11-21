@@ -679,6 +679,21 @@ if [[ -f fs/susfs.c ]] && grep -qF 'security_sb_statfs(' fs/susfs.c \
   sed -i '0,/^#include <linux\/fs.h>$/s//#include <linux\/fs.h>\n#include <linux\/security.h>/' fs/susfs.c
 fi
 
+# 老内核基线（如 6.6.89 2025-06）与 2025-10 版 SUSFS 补丁的 include 上下文不一致：
+# SUS_MAP 检查调用 hunk（fs/proc/base.c 的 BIT_SUS_MAPS / susfs_is_current_proc_umounted）
+# 成功应用，但注入 #include <linux/susfs_def.h> 的 hunk 因上下文漂移被拒，
+# 导致 clang 报 undeclared identifier。此处做兜底：只要 base.c 使用了这些符号
+# 却没有包含 susfs_def.h，就补进该头文件。
+if [[ -f fs/proc/base.c ]] && grep -qF 'BIT_SUS_MAPS' fs/proc/base.c \
+  && ! grep -qF '#include <linux/susfs_def.h>' fs/proc/base.c; then
+  echo "为 fs/proc/base.c 补入缺失的 linux/susfs_def.h（SUS_MAP include hunk 上下文漂移兜底）"
+  sed -i '0,/^#include <linux\/ksm.h>$/s//#include <linux\/ksm.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux\/susfs_def.h>\n#endif \/\/ #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)/' fs/proc/base.c
+  if ! grep -qF '#include <linux/susfs_def.h>' fs/proc/base.c; then
+    echo "::error::base.c 补入 susfs_def.h 失败（未找到 #include <linux/ksm.h> 锚点），请人工核对"
+    exit 1
+  fi
+fi
+
 # 在编译前报告 SUSFS 主补丁产生的冲突文件
 SUSFS_REJ_COUNT=$(find . -name '*.rej' | wc -l)
 if [ "$SUSFS_REJ_COUNT" -gt 0 ]; then
