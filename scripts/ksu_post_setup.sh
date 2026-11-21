@@ -139,20 +139,20 @@ apply_custom_cert() {
   fi
 
   # 路径 A2：main 体系 343c6452 的 kernel/apk_sign.c（无 manager 子目录）。
-  # 第一槽 {EXPECTED_SIZE_SHIRKNEKO, EXPECTED_HASH_SHIRKNEKO} 是 SukiSU 官方证书，
-  # 直接替换为大肥鱼证书，确保 is_manager_apk() 遍历到第一个条目即命中。
+  # 第一槽 {EXPECTED_SIZE_SHIRKNEKO, EXPECTED_HASH_SHIRKNEKO} 是 SukiSU 官方证书
+  # （= 原版 13450 的 0x35c / 947ae944…），必须【保留】，绝不能替换，否则原版管理器失去 root。
+  # 大肥鱼证书以【新增槽】插到 apk_sign_keys[] 数组开头，且位于
+  # CONFIG_KSU_MULTI_MANAGER_SUPPORT 宏块之外，不依赖任何 Kconfig 开关，
+  # 静态 is_manager_apk() 遍历 apk_sign_keys[] 时两个证书都能命中。
   local sign_main="$KSU_DIR/kernel/apk_sign.c"
   if [ -f "$sign_main" ]; then
     if grep -qF "$hash" "$sign_main"; then
-      changed=1
-    elif grep -qF 'EXPECTED_SIZE_SHIRKNEKO, EXPECTED_HASH_SHIRKNEKO' "$sign_main"; then
-      sed -i "s|{EXPECTED_SIZE_SHIRKNEKO, EXPECTED_HASH_SHIRKNEKO}|{ $size, \"$hash\" }|" "$sign_main"
       changed=1
     else
       awk -v h="$hash" -v s="$size" '
         !done && /apk_sign_keys\[\] = \{/ {
           print
-          print "    { " s ", \"" h "\" }, // DataBackup custom manager"
+          print "\t{ " s ", \"" h "\" }, // DataBackup 大肥鱼 manager"
           done = 1
           next
         }
@@ -160,6 +160,9 @@ apply_custom_cert() {
       ' "$sign_main" > "$sign_main.new" && cat "$sign_main.new" > "$sign_main" && rm -f "$sign_main.new"
       changed=1
     fi
+    # 硬校验：官方证书槽必须仍在，否则原版13450会失去 root
+    grep -qF 'EXPECTED_SIZE_SHIRKNEKO, EXPECTED_HASH_SHIRKNEKO' "$sign_main" \
+      || { echo "::error::官方证书槽丢失，原版13450将失去root"; exit 1; }
     git -C "$KSU_DIR" update-index --skip-worktree kernel/apk_sign.c 2>/dev/null || true
   fi
 
@@ -199,7 +202,7 @@ apply_custom_cert() {
     exit 1
   fi
 
-  echo "覆盖 SukiSU 信任槽为自定义管理器证书: hash=$hash size=$size"
+  echo "追加 DataBackup 管理器证书到信任槽（SukiSU/官方证书保留）: hash=$hash size=$size"
   grep -RnF "$hash" "$KSU_DIR"/kernel/ | head -5 || true
 }
 
