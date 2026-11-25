@@ -208,8 +208,8 @@ apply_custom_cert() {
 
 case "$MODE" in
   bakasu)   apply_bakasu ;;
-  # SukiSU：强制焊死我们的证书（忽略环境变量，确保必然生效）
-  sukisu)   apply_sukisu; apply_sukisu_pkg; apply_custom_cert "$KSU_BUILTIN_HASH" "$KSU_BUILTIN_SIZE" ;;
+  # SukiSU：保持原版 13450 官方证书槽；本分支不注入 DataBackup 证书。
+  sukisu)   apply_sukisu; apply_sukisu_pkg ;;
   auto)
     # 自动检测：根据 KSU 目录内容判断变体
     if [ -f "$KSU_DIR/kernel/Kbuild" ] && grep -q "$(echo "${PATTERNS[marker]}" | base64 -d)" "$KSU_DIR/kernel/Kbuild" 2>/dev/null; then
