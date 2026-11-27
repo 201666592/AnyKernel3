@@ -9,6 +9,22 @@ set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# 列出当前目录下不属于上游的 .rej（相对路径，已排序）。
+# 上游分支可能自带已提交的 .rej（如 android15-6.6-2026-04 的 mm/rmap.c.rej，
+# 是上游解决合并冲突时的残留），那不是本补丁的冲突；但 patch 失败时会覆盖同名文件，
+# 所以只有「被 git 跟踪且未改动」的才视为上游自带。
+# 不在 git 仓库里（本地验证）时 git 命令为空，退回全部 .rej
+list_upstream_rej() {
+  git ls-files -- '*.rej' 2>/dev/null | while IFS= read -r f; do
+    git diff --quiet -- "$f" 2>/dev/null && echo "$f"
+  done
+}
+list_untracked_rej() {
+  comm -23 \
+    <(find . -type f -name '*.rej' | sed 's|^\./||' | sort) \
+    <(list_upstream_rej | sort)
+}
+
 echo "应用 SUSFS 补丁..."
 
 SUSFS_PATCH="50_add_susfs_in_gki-$ANDROID_VERSION-$KERNEL_VERSION.patch"
@@ -16,12 +32,73 @@ cp "$SUSFS4KSU/kernel_patches/$SUSFS_PATCH" ./common/
 cp "$SUSFS4KSU"/kernel_patches/fs/* ./common/fs/
 cp "$SUSFS4KSU"/kernel_patches/include/linux/* ./common/include/linux/
 
+# FinaSU 上游自 cdf8711a + 5b83330b（2026-10-23）起树内原生集成 SUSFS，官方
+# docs/builtin-integration.md 明确要求**不要**应用 susfs4ksu 的
+# 10_enable_susfs_for_ksu.patch（该补丁面向上游 KernelSU 手动钩子模型，会把
+# hook/tp_marker.o 等编译单元移出 Kbuild，而 FinaSU 的 kprobe 模型仍引用这些
+# 符号，驱动侧一旦打补丁就会在 vmlinux 链接阶段报 undefined symbol）。
+# 至此 FinaSU 与 SukiSU-Nova/BakaSU 形态一致：驱动侧不打补丁；差异仅在于 FinaSU
+# 的原生集成较新，这里顺带校验其结构（内核侧 50_add 主补丁的内联钩子依赖
+# 这些入口点/符号），漂移时立即报错而不是静默退化。
+verify_finasu_native_susfs() {
+  local FINASU_KSU="$KERNEL_ROOT/KernelSU/kernel"
+  local OPT SYM
+
+  if [ ! -f "$FINASU_KSU/extension/susfs.c" ]; then
+    echo "::error::FinaSU 未包含原生 SUSFS 集成（缺少 KernelSU/kernel/extension/susfs.c）。" >&2
+    echo "::error::当前检出的 FinaSU 早于 5b83330b（2026-10-23），或上游结构再次变化；" >&2
+    echo "::error::旧的 10_enable 驱动侧补丁方案已随上游原生集成废弃，请确认 ksuCommit 指向最新 Release。" >&2
+    exit 1
+  fi
+
+  # Kconfig 自带完整 KSU_SUSFS 菜单（「添加 SUSFS 配置」写入的 CONFIG_KSU_SUSFS*
+  # 必须全部有对应定义，否则 olddefconfig 会静默丢弃）
+  for OPT in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
+             KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+             KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
+    grep -q "^config $OPT\$" "$FINASU_KSU/Kconfig" \
+      || { echo "::error::FinaSU Kconfig 缺少 config $OPT（上游结构可能已变化）" >&2; exit 1; }
+  done
+
+  # extension/susfs.c 提供 50_add 主补丁在 fs/exec.c 内联调用的入口点；
+  # preinit 入口在较新 FinaSU 中已移到 kernel/preinit/preinit.c，兼容旧布局。
+  for SYM in ksu_handle_execveat ksu_handle_execveat_sucompat ksu_handle_post_execveat_sucompat; do
+    grep -qE "^(int|void) $SYM\(" "$FINASU_KSU/extension/susfs.c" \
+      || { echo "::error::FinaSU extension/susfs.c 缺少全局入口点: $SYM" >&2; exit 1; }
+  done
+
+  for SYM in ksu_setup_preinit_file ksu_preinit_handle_post_execveat; do
+    if grep -qE "^(int|void) $SYM\(" "$FINASU_KSU/preinit/preinit.c" 2>/dev/null; then
+      continue
+    fi
+    grep -qE "^(int|void) $SYM\(" "$FINASU_KSU/extension/susfs.c" \
+      || { echo "::error::FinaSU 缺少全局入口点: $SYM（已检查 preinit/preinit.c 与 extension/susfs.c）" >&2; exit 1; }
+  done
+
+  # 三参数 SUSFS 实现（内核侧 kernel/sys.c 的 3 参调用依赖该签名）
+  grep -q '^int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)$' "$FINASU_KSU/hook/setuid_hook.c" \
+    || { echo "::error::FinaSU setuid_hook.c 缺少三参数 ksu_handle_setresuid（上游结构可能已变化）" >&2; exit 1; }
+
+  # my_* 符号已全局导出（6.6/6.12 主补丁在 security/selinux/{hooks,selinuxfs}.c 内联调用）
+  for SYM in my_write_context my_write_access my_setprocattr; do
+    grep -qE "^(ssize_t|int) $SYM\(" "$FINASU_KSU/feature/selinux_hide.c" \
+      || { echo "::error::FinaSU selinux_hide.c 未全局导出 $SYM（SUSFS 内联 SELinux 钩子将无法链接）" >&2; exit 1; }
+  done
+
+  # susfs_init() 由驱动 init 原生调用
+  grep -q 'susfs_init();' "$FINASU_KSU/core/init.c" \
+    || { echo "::error::FinaSU init.c 未调用 susfs_init()（上游结构可能已变化）" >&2; exit 1; }
+
+  echo "FinaSU 原生 SUSFS 集成校验通过"
+}
+
 case "$KSU_VARIANT" in
-  "SukiSU"|"BakaSU")
-    echo "SukiSU/BakaSU 使用内置 SUSFS 支持"
+  "SukiSU-Nova"|"BakaSU")
+    echo "SukiSU-Nova/BakaSU 使用内置 SUSFS 支持"
     ;;
   "FinaSU")
-    echo "FinaSU 使用 susfs4ksu 官方内核侧集成补丁（10_enable + drift-fixes 已在前置步骤应用）"
+    echo "FinaSU 使用树内原生 SUSFS 集成（驱动侧不打补丁，形态同 SukiSU-Nova/BakaSU）"
+    verify_finasu_native_susfs
     ;;
 esac
 
@@ -30,6 +107,34 @@ CURRENT_SUB="$SUB_LEVEL"
 if [[ ! "$CURRENT_SUB" =~ ^[0-9]+$ ]]; then
   CURRENT_SUB=99999
 fi
+
+# ---- susfs4ksu R28 getpriority/priority uid filter 开关归一化 ----
+# 该特性整套代码（含 susfs_switch_to_ksu_domain / susfs_restore_creds 两个辅助
+# 函数）以 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER 为开关，但 SukiSU-Nova(builtin)、
+# BakaSU、FinaSU 的原生驱动 Kconfig 均未定义该选项，同时 SukiSU-Nova 驱动的
+# supercall 分发（CMD_SUSFS_SET_PRIORITY_UID_FILTER）与 pkg_observer 无条件调用
+# susfs_set_priority_uid_filter / susfs_parse_priority_app_strings，于是：
+#   - susfs.c 的两个辅助函数失去唯一调用方，clang -Werror,-Wunused-function
+#     直接中断编译（FinaSU/BakaSU/SukiSU-Nova 三个变体均复现）；
+#   - susfs.h 中的声明被裁掉，SukiSU-Nova 驱动侧报 -Wimplicit-function-declaration。
+# 把开关上提到 CONFIG_KSU_SUSFS（启用 SUSFS 时恒为 y）使特性完整可用。
+# 仅改写预处理指令行：susfs.c 里 copy_config_to_buf() 的
+# "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n" 字符串字面量保持原样，管理器
+# 仍能按原名识别该特性。
+normalize_priority_uid_filter_guard() {
+  local f
+  # 主补丁中的 +#ifdef/+#endif 行（不触碰上下文行，hunk 行数不变，可正常应用）
+  [[ -f "$SUSFS_PATCH" ]] \
+    && sed -i -E '/^[+ ]*#[[:space:]]*(ifdef|ifndef|endif).*CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER/ s/CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER/CONFIG_KSU_SUSFS/' "$SUSFS_PATCH"
+  # 已拷贝进内核树的源码与头文件
+  for f in fs/susfs.c include/linux/susfs.h; do
+    [[ -f "$f" ]] || continue
+    sed -i -E '/^#[[:space:]]*(ifdef|ifndef|endif).*CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER/ s/CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER/CONFIG_KSU_SUSFS/' "$f"
+  done
+}
+
+normalize_priority_uid_filter_guard
+echo "已把 PRIORITY_UID_FILTER 开关归一化为 CONFIG_KSU_SUSFS"
 
 # 兼容缺少 VMA padding 接口的 5.10.66～209、5.15.74～144 和 6.1.25～68
 if grep -qF 'VMA_PAD_START(vma)' "$SUSFS_PATCH" \
@@ -60,6 +165,12 @@ if [[ "$ANDROID_VERSION" == "android12" && "$KERNEL_VERSION" == "5.10" ]]; then
     echo "临时调整 Android 12 5.10 fdinfo.c 上下文"
     adjust_legacy_fdinfo_context
   fi
+fi
+
+# Android 13 的 5.10.107 仍使用旧式 fdinfo 上下文，与 Android 12 旧版本相同
+if [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.10" && "$CURRENT_SUB" -le 107 ]]; then
+  echo "临时调整 Android 13 5.10 fdinfo.c 上下文"
+  adjust_legacy_fdinfo_context
 fi
 
 if [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.15" ]]; then
@@ -171,18 +282,6 @@ if [[ "$ANDROID_VERSION" == "android16" && "$KERNEL_VERSION" == "6.12" ]]; then
   normalize_exec_include_hunk
 fi
 
-# 新版内核在 super.c 的 internal.h 之后新增了 trace/hooks/fs.h，
-# 旧版 SUSFS 主补丁以 thaw_super_locked 为上下文插入 extern 声明，会整段被拒绝；
-# 上游 2026-09-15 起已把声明挪到 unnamed_dev_ida 之后，不再依赖这段上下文，
-# 但 ShirkNeko fork 尚未同步（固定提交的旧版补丁不改 super.c），只对旧版补丁做临时调整
-SUPER_FS_H_REMOVED=""
-if grep -q '^ static int thaw_super_locked' "$SUSFS_PATCH" \
-  && grep -qF '#include <trace/hooks/fs.h>' fs/super.c; then
-  echo "临时调整 super.c 上下文"
-  sed -i '/^#include <trace\/hooks\/fs.h>$/,+1d' fs/super.c
-  SUPER_FS_H_REMOVED=1
-fi
-
 # 上游 rebase 到 5.15.211 后，susfs_def.h 的插入 hunk 把 trace/hooks 头文件
 # 当成了上下文：5.15.74~194 源码没有这些行，hunk 会整段被拒，最终因
 # SUSFS_IS_INODE_* 隐式声明在 clang -Werror 处中断。按源码实际内容归一化补丁副本。
@@ -191,98 +290,79 @@ python3 "$SCRIPT_DIR/normalize_trace_ctx.py" "$SUSFS_PATCH"
 
 patch -p1 < "$SUSFS_PATCH" || true
 
-# ==================== SukiSU builtin 新 selinux_hide 模型适配（services.c 跳板符号） ====================
-# SukiSU-Ultra builtin 2026-05-29 (5fb0c079) 同步 tiann/KernelSU 的 SELinux 新检测
-# 修复后，feature/selinux_hide.c 在 >=6.6 分支把 security_dump_masked_av_fn /
-# context_struct_compute_av_fn 声明为 extern 函数——上游预期由 services.c 补丁提供
-# 这两个跳板符号（builtin c32094a4 提交说明），但 SUSFS 主补丁只在 services.c 提供
-# my_security_compute_av_user，不含这两个符号，导致 6.6/6.12 全部 SUSFS 构建在
-# vmlinux 链接阶段报：
-#   ld.lld: error: undefined symbol: context_struct_compute_av_fn
-# 在 services.c 末尾补上两个跳板（对同名 static 函数的薄封装，与上游预期形态一致）；
-# 仅当检测到 builtin 的 extern 引用且 services.c 尚无跳板时追加，
-# 上游自行提供后按内容检测自动跳过，幂等。
-KSU_HIDE_FILE="$KERNEL_ROOT/KernelSU/kernel/feature/selinux_hide.c"
-SEC_SERVICES="security/selinux/ss/services.c"
-if [ -f "$KSU_HIDE_FILE" ] && grep -q 'extern void context_struct_compute_av_fn' "$KSU_HIDE_FILE" \
-  && [ -f "$SEC_SERVICES" ] && ! grep -q 'void context_struct_compute_av_fn(' "$SEC_SERVICES"; then
-  if ! grep -q 'static void context_struct_compute_av(' "$SEC_SERVICES"; then
-    echo "::error::services.c 缺少 static context_struct_compute_av，无法生成 SukiSU 跳板符号"
-    exit 1
-  fi
-  echo "补齐 SukiSU builtin selinux_hide 所需的 services.c 跳板符号..."
-  python3 - "$SEC_SERVICES" <<'PYEOF'
+# SUSFS uses its own AV decision helper for the hidden SELinux access path.
+# Keep its reported sequence stable instead of exposing the live policy
+# generation through /selinux/access. Do not change the kernel's avd_init().
+for f in security/selinux/ss/services.c security/selinux/hooks.c; do
+  [ -f "$f" ] || continue
+  if grep -q 'void susfs_security_compute_av_user' "$f" \
+    && ! grep -q 'avd->seqno = 1;' "$f"; then
+    python3 - "$f" <<'PYEOF'
+import re
 import sys
 
 path = sys.argv[1]
-src = open(path, encoding="utf-8", errors="surrogateescape").read()
-if "void context_struct_compute_av_fn(" in src:
-    sys.exit(0)
-tramp = (
-    "\n"
-    "/* Trampolines for SukiSU-Ultra builtin selinux_hide (KSU_SUSFS builds):\n"
-    " * kernel/feature/selinux_hide.c (>=6.6 model) declares *_fn as extern;\n"
-    " * provide thin wrappers around the static implementations here. */\n"
-    "#ifdef CONFIG_KSU_SUSFS\n"
-    "void context_struct_compute_av_fn(struct policydb *policydb,\n"
-    "\t\t\t\t  struct context *scontext,\n"
-    "\t\t\t\t  struct context *tcontext,\n"
-    "\t\t\t\t  u16 tclass,\n"
-    "\t\t\t\t  struct av_decision *avd,\n"
-    "\t\t\t\t  struct extended_perms *xperms);\n"
-    "void context_struct_compute_av_fn(struct policydb *policydb,\n"
-    "\t\t\t\t  struct context *scontext,\n"
-    "\t\t\t\t  struct context *tcontext,\n"
-    "\t\t\t\t  u16 tclass,\n"
-    "\t\t\t\t  struct av_decision *avd,\n"
-    "\t\t\t\t  struct extended_perms *xperms)\n"
-    "{\n"
-    "\tcontext_struct_compute_av(policydb, scontext, tcontext, tclass, avd, xperms);\n"
-    "}\n"
-)
-if "static void security_dump_masked_av(" in src:
-    tramp += (
-        "\n"
-        "void security_dump_masked_av_fn(struct policydb *policydb,\n"
-        "\t\t\t\tstruct context *scontext,\n"
-        "\t\t\t\tstruct context *tcontext,\n"
-        "\t\t\t\tu16 tclass,\n"
-        "\t\t\t\tu32 permissions,\n"
-        "\t\t\t\tconst char *reason);\n"
-        "void security_dump_masked_av_fn(struct policydb *policydb,\n"
-        "\t\t\t\tstruct context *scontext,\n"
-        "\t\t\t\tstruct context *tcontext,\n"
-        "\t\t\t\tu16 tclass,\n"
-        "\t\t\t\tu32 permissions,\n"
-        "\t\t\t\tconst char *reason)\n"
-        "{\n"
-        "\tsecurity_dump_masked_av(policydb, scontext, tcontext, tclass, permissions, reason);\n"
-        "}\n"
-    )
-else:
-    print("::warning::services.c 缺少 static security_dump_masked_av，跳过对应跳板")
-tramp += "#endif /* CONFIG_KSU_SUSFS */\n"
-open(path, "w", encoding="utf-8", errors="surrogateescape").write(src + tramp)
-print("%s: appended *_fn trampolines" % path)
-PYEOF
-  grep -q 'void context_struct_compute_av_fn(' "$SEC_SERVICES" \
-    || { echo "::error::services.c 跳板符号追加后校验失败"; exit 1; }
-  echo "services.c: 已提供 context_struct_compute_av_fn / security_dump_masked_av_fn"
-fi
+with open(path, encoding="utf-8", errors="surrogateescape") as f:
+    text = f.read()
 
-# ==================== KernelSU 缺失的 SUSFS 内联钩子符号（6.6+/6.12 主补丁形态）====================
-# 6.6/6.12 主补丁在 security/selinux/{hooks,selinuxfs}.c 内联改写调用点，要求 KernelSU 侧
-# 以全局符号提供 my_setprocattr / my_write_context / my_write_access；并在 fs/exec.c 调用
-# ksu_setup_preinit_file / ksu_preinit_handle_post_execveat（受 KSU_NO_PREINIT 开关控制）。
-# SukiSU-Ultra（builtin 5ef32ad / main 31255c4）两者都不提供，KPM+SUSFS 的 6.12 构建在
-# vmlinux 链接阶段报：
-#   ld.lld: error: undefined symbol: my_setprocattr / my_write_context / my_write_access
-#   ld.lld: error: undefined symbol: ksu_setup_preinit_file / ksu_preinit_handle_post_execveat
-# 处理：按 KernelSU 实际能力裁剪（SELinux 包装函数回落到内核原生处理函数、preinit 走主补丁
-# 自带开关），保留 SUSFS 其余功能；KernelSU 上游补齐后脚本按内容检测自动跳过，幂等。
-echo "按 KernelSU 实际能力裁剪 SUSFS 内联钩子..."
-python3 "$SCRIPT_DIR/ksu_susfs_hooks.py" "$KERNEL_ROOT" \
-  || { echo "::error::SUSFS 内联钩子裁剪失败"; exit 1; }
+match = re.search(r"void susfs_security_compute_av_user\(", text)
+if not match:
+    raise SystemExit("SUSFS AV helper not found")
+end = text.find("\n}\n", match.start())
+if end < 0:
+    raise SystemExit("SUSFS AV helper is incomplete")
+body = text[match.start():end]
+needle = "\tavd_init(policy, avd);"
+if body.count(needle) != 1:
+    raise SystemExit("unexpected SUSFS AV initialization")
+body = body.replace(needle, needle + "\n\tavd->seqno = 1;", 1)
+text = text[:match.start()] + body + text[end:]
+with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+    f.write(text)
+PYEOF
+    echo "$f: SUSFS access results now report SELinux sequence 1"
+  fi
+done
+
+# ==================== SUSFS：SELinux 钩子不再拦截 sandbox uid ====================
+# 背景：susfs4ksu 主补丁的 SELinux 钩子条件写成 current_uid().val >= 10000，
+#   把 Android 的 isolated / webview sandbox（90000~99999，WebView 渲染进程是
+#   99000+）也纳入拦截。zygote 创建渲染进程时用 setcontext 设定 sandbox 域，
+#   一旦走 SUSFS 的伪装策略校验就返回 EINVAL（bugreport 实测：
+#   "selinux_android_setcontext: Error setting context for app with uid 99000 ...
+#   Invalid argument"），渲染进程直接 abort → 管理器里的模块 WebUI 白屏。
+# 处理：把拦截范围收窄到普通应用 uid（10000~89999），sandbox 进程一律走原生
+#   selinux_setprocattr / sel_write_context；检测软件都在 10xxx，隐藏不受影响。
+for f in security/selinux/hooks.c security/selinux/selinuxfs.c; do
+  [ -f "$f" ] || continue
+  if grep -q 'current_uid()\.val < 90000' "$f"; then
+    echo "$f: SELinux 钩子已排除 sandbox uid，跳过"
+    continue
+  fi
+  n=$(grep -c 'current_uid()\.val >= 10000' "$f" 2>/dev/null || true)
+  if [ "${n:-0}" -gt 0 ]; then
+    sed -i 's/current_uid()\.val >= 10000/current_uid().val >= 10000 \&\& current_uid().val < 90000/g' "$f"
+    echo "$f: SELinux 钩子已排除 sandbox uid（$n 处）"
+  fi
+done
+
+# 守护：上游 2026-11-14/15 起把 SELinux 钩子抽成 handle_selinux_* 分发函数并
+# 注册进 selinux_hooks[]（同时保留旧的内联形态），门控条件写法有
+#   likely(current_uid().val >= 10000 && ksu_selinux_hide_running)
+#   (likely(...))、多行 && 续行 等多种变体；未来还可能改用 AID_APP_START 别名。
+# 上面 sed 按字面 "current_uid().val >= 10000" 全局替换，正常应全部命中；
+# 若上游再改写法导致漏网，sandbox uid（90000~99999）会被 SELinux 隐藏钩子
+# 拦截，WebView 渲染进程 setcontext 失败、模块 WebUI 白屏。
+# 这里按 SELinux 语义断言：文件里凡出现 ksu_selinux_hide_running 门控，必须
+# 同时存在 < 90000 收窄；否则立即报错，避免静默退化。
+for f in security/selinux/hooks.c security/selinux/selinuxfs.c; do
+  [ -f "$f" ] || continue
+  if grep -q 'ksu_selinux_hide_running' "$f" \
+    && ! grep -q 'current_uid()\.val < 90000' "$f"; then
+    echo "::error::$f 存在 SELinux 隐藏门（ksu_selinux_hide_running）但未收窄 sandbox uid（< 90000），上游写法已变化，请人工核对"
+    exit 1
+  fi
+done
 
 # ==================== FinaSU 新 selinux_hide 模型适配 ====================
 # 自 FinaSU v0.1.0-preview1 起，kernel/feature/selinux_hide.c 换成了 tiann 新形态：
@@ -630,31 +710,6 @@ PYEOF
   fi
 fi
 
-# 为尚未提供 SU 会话 FD 接口的 SukiSU/BakaSU 恢复旧版 exec hook 行为
-EXEC_HELPER=""
-if [[ "$KSU_VARIANT" == SukiSU* || "$KSU_VARIANT" == "BakaSU" || "$KSU_VARIANT" == "FinaSU" ]]; then
-  if grep -qF 'ksu_install_su_fd();' fs/exec.c; then
-    EXEC_HELPER="ksu_install_su_fd"
-  elif grep -qF 'ksu_handle_post_execveat_sucompat(' fs/exec.c; then
-    EXEC_HELPER="ksu_handle_post_execveat_sucompat"
-  fi
-fi
-if [[ -n "$EXEC_HELPER" ]] \
-  && ! grep -RqsE --include='*.c' "^[[:space:]]*int[[:space:]]+${EXEC_HELPER}[[:space:]]*\(" "$KERNEL_ROOT/KernelSU/kernel"; then
-  echo "$KSU_VARIANT 尚未提供 $EXEC_HELPER，恢复旧版 exec hook"
-  sed -i '/^extern int ksu_install_su_fd(void);$/d' fs/exec.c
-  sed -i '/^extern int ksu_handle_post_execveat_sucompat(/,+1d' fs/exec.c
-  sed -i 's/is_su_session = !\(ksu_handle_execveat[^;]*;\)/\1/' fs/exec.c
-  sed -i '/^[[:space:]]*bool is_su_session = false;$/d' fs/exec.c
-  sed -i '/^[[:space:]]*if (unlikely(is_su_session && retval >= 0))$/,+1d' fs/exec.c
-  sed -i '/^[[:space:]]*if (unlikely(is_su_session))$/,+1d' fs/exec.c
-  sed -i '/^#ifdef CONFIG_KSU_SUSFS$/N;/^#ifdef CONFIG_KSU_SUSFS\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS$/d' fs/exec.c
-  if grep -qE 'ksu_install_su_fd|ksu_handle_post_execveat_sucompat|is_su_session' fs/exec.c; then
-    echo "::error::$KSU_VARIANT exec hook 结构已变化，无法完成兼容修复"
-    exit 1
-  fi
-fi
-
 # 上游 5.10 主补丁把 susfs_sus_kstat_spoof_vfs_statfs 的 extern 声明放在了
 # fs/statfs.c 的使用点之后（vfs_statfs 之前），clang -Werror 报隐式声明；
 # 声明属于 SUSFS 接口，直接补进公共头 include/linux/susfs_def.h：
@@ -671,34 +726,12 @@ if [[ -f fs/statfs.c ]] && grep -qF 'susfs_sus_kstat_spoof_vfs_statfs(' fs/statf
   sed -i '/^#endif \/\/ #ifndef KSU_SUSFS_DEF_H$/i struct inode;\nstruct kstatfs;\nextern int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, bool *is_fuse);' "$SUSFS_DEF_H"
 fi
 
-# 上游 susfs.c 直接调用 security_sb_statfs 却没有包含 linux/security.h，
-# 5.15+ 靠其他头文件间接带入，5.10 没有这条路径，clang -Werror 报隐式声明；缺失时补上
-if [[ -f fs/susfs.c ]] && grep -qF 'security_sb_statfs(' fs/susfs.c \
-  && ! grep -qF '#include <linux/security.h>' fs/susfs.c; then
-  echo "为 susfs.c 补充 linux/security.h 头文件"
-  sed -i '0,/^#include <linux\/fs.h>$/s//#include <linux\/fs.h>\n#include <linux\/security.h>/' fs/susfs.c
-fi
-
-# 老内核基线（如 6.6.89 2025-06）与 2025-10 版 SUSFS 补丁的 include 上下文不一致：
-# SUS_MAP 检查调用 hunk（fs/proc/base.c 的 BIT_SUS_MAPS / susfs_is_current_proc_umounted）
-# 成功应用，但注入 #include <linux/susfs_def.h> 的 hunk 因上下文漂移被拒，
-# 导致 clang 报 undeclared identifier。此处做兜底：只要 base.c 使用了这些符号
-# 却没有包含 susfs_def.h，就补进该头文件。
-if [[ -f fs/proc/base.c ]] && grep -qF 'BIT_SUS_MAPS' fs/proc/base.c \
-  && ! grep -qF '#include <linux/susfs_def.h>' fs/proc/base.c; then
-  echo "为 fs/proc/base.c 补入缺失的 linux/susfs_def.h（SUS_MAP include hunk 上下文漂移兜底）"
-  sed -i '0,/^#include <linux\/ksm.h>$/s//#include <linux\/ksm.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux\/susfs_def.h>\n#endif \/\/ #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)/' fs/proc/base.c
-  if ! grep -qF '#include <linux/susfs_def.h>' fs/proc/base.c; then
-    echo "::error::base.c 补入 susfs_def.h 失败（未找到 #include <linux/ksm.h> 锚点），请人工核对"
-    exit 1
-  fi
-fi
-
-# 在编译前报告 SUSFS 主补丁产生的冲突文件
-SUSFS_REJ_COUNT=$(find . -name '*.rej' | wc -l)
+# 在编译前报告 SUSFS 主补丁产生的冲突文件，上游自带的已提交 .rej 不计入
+mapfile -t SUSFS_REJ_FILES < <(list_untracked_rej)
+SUSFS_REJ_COUNT=${#SUSFS_REJ_FILES[@]}
 if [ "$SUSFS_REJ_COUNT" -gt 0 ]; then
   echo "::warning title=SUSFS 补丁冲突::SUSFS 主补丁产生了 ${SUSFS_REJ_COUNT} 个 .rej 冲突文件，可能导致后续编译失败（详见 Rejects 产物）"
-  find . -name '*.rej' -print
+  printf '%s\n' "${SUSFS_REJ_FILES[@]}"
 fi
 
 # 还原仅用于补丁匹配的临时源码调整
@@ -711,6 +744,11 @@ if [[ "$ANDROID_VERSION" == "android12" && "$KERNEL_VERSION" == "5.10" ]]; then
     echo "还原 Android 12 5.10 fdinfo.c 临时调整"
     restore_legacy_fdinfo_context
   fi
+fi
+
+if [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.10" && "$CURRENT_SUB" -le 107 ]]; then
+  echo "还原 Android 13 5.10 fdinfo.c 临时调整"
+  restore_legacy_fdinfo_context
 fi
 
 if [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.15" ]]; then
@@ -758,15 +796,17 @@ if [[ "$ANDROID_VERSION" == "android15" && "$KERNEL_VERSION" == "6.6" ]]; then
   fi
 fi
 
-if [[ -n "$SUPER_FS_H_REMOVED" ]] \
-  && ! grep -qF '#include <trace/hooks/fs.h>' fs/super.c; then
-  echo "还原 super.c 临时调整"
-  sed -i '/^#include "internal.h"$/a #include <trace/hooks/fs.h>' fs/super.c
-fi
-
 fix_missing_vm_flags_clear() {
-  if [[ "$OS_PATCH_LEVEL" == "2024-11" ]] && grep -qF 'vm_flags_clear(new_vma, VM_PAD_MASK);' ./mm/mmap.c; then
+  # Google 2024-11 及更新的 deprecated 分支带入了 16KB 页迁移的 VMA padding：
+  # mm/mmap.c 的 copy_vma() 调用 vm_flags_clear()，但同分支 include/linux 未
+  # 提供该（6.3+ 才引入的）helper，clang -Werror 报隐式声明中断编译。
+  # 按源码内容检测：helper 齐备（6.6+ 原生）或无调用时自动跳过，
+  # 不再按 OS_PATCH_LEVEL 猜测命中范围（android13-5.10 / android14-5.15 的
+  # 2024-11 分支与 android12-5.10 / android13-5.15 同样命中）。
+  if grep -qF 'vm_flags_clear(new_vma, VM_PAD_MASK);' ./mm/mmap.c \
+    && ! grep -Rqs 'vm_flags_clear' ./include/linux; then
     sed -i 's/vm_flags_clear(new_vma, VM_PAD_MASK);/new_vma->vm_flags \&= ~VM_PAD_MASK;/' ./mm/mmap.c
+    echo "已替换 mm/mmap.c 缺失 helper 的 vm_flags_clear 调用（VMA padding 半回移兼容）"
   fi
 }
 
@@ -781,17 +821,18 @@ fix_task_mmu_show_pad() {
   fi
 }
 
+# mmap.c 的 vm_flags_clear 半回移修复对所有内核统一按内容检测（函数内部自带
+# 守卫，helper 齐备或无调用时为空操作），覆盖各 android 版本 2024-11 起
+# 持续更新的 deprecated 分支
+fix_missing_vm_flags_clear
+
 # Android 12 - 5.10 修复
 if [[ "$ANDROID_VERSION" == "android12" && "$KERNEL_VERSION" == "5.10" ]]; then
-  # 修复 2024-11 分支: mmap.c 调用了 vm_flags_clear()，但同分支 mm.h 未提供 helper
-  fix_missing_vm_flags_clear
   fix_task_mmu_show_pad 209
 fi
 
 # Android 13 - 5.15 修复
-  if [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.15" ]]; then
-  # 修复 2024-11 分支: mmap.c 调用了 vm_flags_clear()，但同分支 mm.h 未提供 helper
-  fix_missing_vm_flags_clear
+if [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.15" ]]; then
   fix_task_mmu_show_pad 148 "2024-05"
 fi
 
@@ -802,7 +843,7 @@ fi
 
 # Android 15 - 6.6 修复
 if [[ "$ANDROID_VERSION" == "android15" && "$KERNEL_VERSION" == "6.6" ]]; then
-  # 修复老版 SukiSU 6.6.50~6.6.58: task_mmu.c 打入 SUSFS 后使用 vma，但旧源码没有对应声明
+  # 修复老版 SukiSU-Nova 6.6.50~6.6.58: task_mmu.c 打入 SUSFS 后使用 vma，但旧源码没有对应声明
   if [[ -n "$LEGACY_SUKISU_CONFIG" && "$CURRENT_SUB" -ge 50 && "$CURRENT_SUB" -le 58 ]] \
     && grep -qF 'vma = find_vma(mm, start_vaddr);' ./fs/proc/task_mmu.c; then
     TASK_MMU_PATCH="$KERNEL_PATCHES/wild/archived/susfs_fix_patches/v2.1.0/a15-6.6/task_mmu.c.patch"
@@ -822,7 +863,7 @@ fi
 
 # Android 16 - 6.12 修复
 if [[ "$ANDROID_VERSION" == "android16" && "$KERNEL_VERSION" == "6.12" ]]; then
-  # 固定旧版 SukiSU 在 6.12 上会重复定义 setresuid hook
+  # 固定旧版 SukiSU-Nova 在 6.12 上会重复定义 setresuid hook
   SETUID_HOOK="$KERNEL_ROOT/common/drivers/kernelsu/setuid_hook.c"
   if [[ -n "$LEGACY_SUKISU_CONFIG" && -f "$SETUID_HOOK" ]] \
     && grep -qF 'defined(CONFIG_KSU_MANUAL_HOOK))' "$SETUID_HOOK"; then
